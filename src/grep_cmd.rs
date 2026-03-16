@@ -1,3 +1,4 @@
+use crate::config;
 use crate::tracking;
 use crate::utils::resolved_command;
 use anyhow::{Context, Result};
@@ -110,7 +111,8 @@ pub fn run(
         let file_display = compact_path(file);
         rtk_output.push_str(&format!("📄 {} ({}):\n", file_display, matches.len()));
 
-        for (line_num, content) in matches.iter().take(25) {
+        let per_file = config::limits().grep_max_per_file;
+        for (line_num, content) in matches.iter().take(per_file) {
             rtk_output.push_str(&format!("  {:>4}: {}\n", line_num, content));
             shown += 1;
             if shown >= max_results {
@@ -118,8 +120,8 @@ pub fn run(
             }
         }
 
-        if matches.len() > 25 {
-            rtk_output.push_str(&format!("  +{}\n", matches.len() - 25));
+        if matches.len() > per_file {
+            rtk_output.push_str(&format!("  +{}\n", matches.len() - per_file));
         }
         rtk_output.push('\n');
     }

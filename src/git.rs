@@ -1,3 +1,4 @@
+use crate::config;
 use crate::tracking;
 use crate::utils::resolved_command;
 use anyhow::{Context, Result};
@@ -592,33 +593,37 @@ fn format_status_output(porcelain: &str) -> String {
     }
 
     // Build summary
+    let limits = config::limits();
+    let max_files = limits.status_max_files;
+    let max_untracked = limits.status_max_untracked;
+
     if staged > 0 {
         output.push_str(&format!("✅ Staged: {} files\n", staged));
-        for f in staged_files.iter().take(15) {
+        for f in staged_files.iter().take(max_files) {
             output.push_str(&format!("   {}\n", f));
         }
-        if staged_files.len() > 15 {
-            output.push_str(&format!("   ... +{} more\n", staged_files.len() - 15));
+        if staged_files.len() > max_files {
+            output.push_str(&format!("   ... +{} more\n", staged_files.len() - max_files));
         }
     }
 
     if modified > 0 {
         output.push_str(&format!("📝 Modified: {} files\n", modified));
-        for f in modified_files.iter().take(15) {
+        for f in modified_files.iter().take(max_files) {
             output.push_str(&format!("   {}\n", f));
         }
-        if modified_files.len() > 15 {
-            output.push_str(&format!("   ... +{} more\n", modified_files.len() - 15));
+        if modified_files.len() > max_files {
+            output.push_str(&format!("   ... +{} more\n", modified_files.len() - max_files));
         }
     }
 
     if untracked > 0 {
         output.push_str(&format!("❓ Untracked: {} files\n", untracked));
-        for f in untracked_files.iter().take(10) {
+        for f in untracked_files.iter().take(max_untracked) {
             output.push_str(&format!("   {}\n", f));
         }
-        if untracked_files.len() > 10 {
-            output.push_str(&format!("   ... +{} more\n", untracked_files.len() - 10));
+        if untracked_files.len() > max_untracked {
+            output.push_str(&format!("   ... +{} more\n", untracked_files.len() - max_untracked));
         }
     }
 
