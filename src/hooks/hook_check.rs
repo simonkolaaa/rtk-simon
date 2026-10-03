@@ -1,8 +1,7 @@
 //! Detects whether RTK hooks are installed and warns if they are outdated.
 
 use super::constants::{
-    CLAUDE_DIR, CODEX_DIR, CURSOR_DIR, GEMINI_DIR, GEMINI_HOOK_FILE, HOOKS_SUBDIR,
-    OPENCODE_PLUGIN_PATH, REWRITE_HOOK_FILE,
+    CLAUDE_DIR, HOOKS_SUBDIR, REWRITE_HOOK_FILE,
 };
 use crate::core::constants::RTK_DATA_DIR;
 use std::path::PathBuf;
