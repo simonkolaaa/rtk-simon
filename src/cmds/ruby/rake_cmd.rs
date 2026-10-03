@@ -5,8 +5,12 @@
 //! Uses `ruby_exec("rake")` to auto-detect `bundle exec`.
 
 use crate::core::runner;
+use crate::core::truncate::CAP_WARNINGS;
 use crate::core::utils::{ruby_exec, strip_ansi};
 use anyhow::Result;
+use std::sync::LazyLock;
+
+const MAX_RAKE_FAILURES: usize = CAP_WARNINGS;
 
 /// Decide whether to use `rake test` or `rails test` based on args.
 ///
@@ -160,10 +164,9 @@ fn filter_minitest_output(output: &str) -> String {
 }
 
 fn is_failure_header(line: &str) -> bool {
-    lazy_static::lazy_static! {
-        static ref RE_FAILURE: regex::Regex =
-            regex::Regex::new(r"^\d+\)\s+(Failure|Error):$").unwrap();
-    }
+    static RE_FAILURE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^\d+\)\s+(Failure|Error):$").unwrap());
+
     RE_FAILURE.is_match(line)
 }
 
@@ -198,7 +201,7 @@ fn build_minitest_summary(summary: &str, failures: &[String]) -> String {
 
     result.push('\n');
 
-    for (i, failure) in failures.iter().take(10).enumerate() {
+    for (i, failure) in failures.iter().take(MAX_RAKE_FAILURES).enumerate() {
         let lines: Vec<&str> = failure.lines().collect();
         // First line is like "  1) Failure:" or "  1) Error:"
         if let Some(header) = lines.first() {
@@ -214,13 +217,16 @@ fn build_minitest_summary(summary: &str, failures: &[String]) -> String {
                 ));
             }
         }
-        if i < failures.len().min(10) - 1 {
+        if i < failures.len().min(MAX_RAKE_FAILURES) - 1 {
             result.push('\n');
         }
     }
 
-    if failures.len() > 10 {
-        result.push_str(&format!("\n... +{} more failures\n", failures.len() - 10));
+    if failures.len() > MAX_RAKE_FAILURES {
+        result.push_str(&format!(
+            "\n... +{} more failures\n",
+            failures.len() - MAX_RAKE_FAILURES
+        ));
     }
 
     result.trim().to_string()
@@ -236,16 +242,16 @@ fn parse_minitest_summary(summary: &str) -> (usize, usize, usize, usize, usize) 
     for part in summary.split(',') {
         let part = part.trim();
         let words: Vec<&str> = part.split_whitespace().collect();
-        if words.len() >= 2 {
-            if let Ok(n) = words[0].parse::<usize>() {
-                match words[1].trim_end_matches(',') {
-                    "runs" | "run" | "tests" | "test" => runs = n,
-                    "assertions" | "assertion" => assertions = n,
-                    "failures" | "failure" => failures = n,
-                    "errors" | "error" => errors = n,
-                    "skips" | "skip" => skips = n,
-                    _ => {}
-                }
+        if words.len() >= 2
+            && let Ok(n) = words[0].parse::<usize>()
+        {
+            match words[1].trim_end_matches(',') {
+                "runs" | "run" | "tests" | "test" => runs = n,
+                "assertions" | "assertion" => assertions = n,
+                "failures" | "failure" => failures = n,
+                "errors" | "error" => errors = n,
+                "skips" | "skip" => skips = n,
+                _ => {}
             }
         }
     }

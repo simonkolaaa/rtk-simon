@@ -1,12 +1,13 @@
 //! Detects whether RTK hooks are installed and warns if they are outdated.
 
-use super::constants::{
-    CLAUDE_DIR, HOOKS_SUBDIR, REWRITE_HOOK_FILE,
-};
-use crate::core::constants::RTK_DATA_DIR;
+use super::constants::{HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON};
+use super::init::resolve_claude_dir;
+use super::is_claude_hook_command;
+use crate::core::user_dirs;
+use crate::core::utils::from_json_str;
 use std::path::PathBuf;
 
-const CURRENT_HOOK_VERSION: u8 = 3;
+const CURRENT_HOOK_VERSION: u8 = 4;
 const WARN_INTERVAL_SECS: u64 = 24 * 3600;
 
 /// Hook status for diagnostics and `rtk gain`.
@@ -24,14 +25,26 @@ pub enum HookStatus {
 /// Returns `Ok` if no Claude Code is detected (not applicable).
 pub fn status() -> HookStatus {
     // Don't warn users who don't have Claude Code installed
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return HookStatus::Ok,
+    let claude_dir = match resolve_claude_dir() {
+        Ok(d) => d,
+        Err(_) => return HookStatus::Ok,
     };
-    if !home.join(CLAUDE_DIR).exists() {
+    if !claude_dir.exists() {
         return HookStatus::Ok;
     }
 
+    // Check for new binary command in settings.json first
+    if binary_hook_registered(&claude_dir) {
+        // If old script file still exists alongside new command, report Outdated
+        // (migration not complete — user should run `rtk init -g` to clean up)
+        let old_hook = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
+        if old_hook.exists() {
+            return HookStatus::Outdated;
+        }
+        return HookStatus::Ok;
+    }
+
+    // Fall back to legacy script file check
     let Some(hook_path) = hook_installed_path() else {
         return HookStatus::Missing;
     };
@@ -45,36 +58,77 @@ pub fn status() -> HookStatus {
     }
 }
 
+/// Check if the native binary command is registered in settings.json
+fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
+    let settings_path = claude_dir.join(SETTINGS_JSON);
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(c) if !c.trim().is_empty() => c,
+        _ => return false,
+    };
+    let root: serde_json::Value = match from_json_str(&content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let pre_tool_use = match root
+        .get("hooks")
+        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
+        .and_then(|p| p.as_array())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+    pre_tool_use
+        .iter()
+        .filter_map(|entry| entry.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|hook| hook.get("command")?.as_str())
+        .any(is_claude_hook_command)
+}
+
 /// Check if the installed hook is missing or outdated, warn once per day.
 pub fn maybe_warn() {
     // Don't block startup — fail silently on any error
     let _ = check_and_warn();
 }
 
+/// Message to print for `status`, if any.
+/// `suppress_missing` only hides [`HookStatus::Missing`]; outdated stays visible.
+fn warning_text(status: HookStatus, suppress_missing: bool) -> Option<&'static str> {
+    match status {
+        HookStatus::Ok => None,
+        HookStatus::Missing if suppress_missing => None,
+        HookStatus::Missing => {
+            Some("[rtk] /!\\ No hook installed — run `rtk init -g` for automatic token savings")
+        }
+        HookStatus::Outdated => Some("[rtk] /!\\ Hook outdated — run `rtk init -g` to update"),
+    }
+}
+
 /// Single source of truth: delegates to `status()` then rate-limits the warning.
 fn check_and_warn() -> Option<()> {
-    let warning = match status() {
-        HookStatus::Ok => return Some(()),
-        HookStatus::Missing => {
-            "[rtk] /!\\ No hook installed — run `rtk init -g` for automatic token savings"
-        }
-        HookStatus::Outdated => "[rtk] /!\\ Hook outdated — run `rtk init -g` to update",
-    };
+    // Probe first so the common HookStatus::Ok path never reads config.toml.
+    // Suppression is consulted only when a missing-hook warning would print.
+    let status = status();
+    if status == HookStatus::Ok {
+        return Some(());
+    }
+    let suppress_missing =
+        status == HookStatus::Missing && crate::core::config::hook_warning_suppressed();
+    let warning = warning_text(status, suppress_missing)?;
 
     // Rate limit: warn once per day
     let marker = warn_marker_path()?;
-    if let Ok(meta) = std::fs::metadata(&marker) {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX) < WARN_INTERVAL_SECS {
-                return Some(());
-            }
-        }
+    if let Ok(meta) = std::fs::metadata(&marker)
+        && let Ok(modified) = meta.modified()
+        && modified.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX) < WARN_INTERVAL_SECS
+    {
+        return Some(());
     }
 
     eprintln!("{}", warning);
 
     // Touch marker after warning is printed
-    let _ = std::fs::create_dir_all(marker.parent()?);
+    let _ = crate::core::utils::create_private_dir(marker.parent()?);
     let _ = std::fs::write(&marker, b"");
 
     Some(())
@@ -83,51 +137,57 @@ fn check_and_warn() -> Option<()> {
 pub fn parse_hook_version(content: &str) -> u8 {
     // Version tag must be in the first 5 lines (shebang + header convention)
     for line in content.lines().take(5) {
-        if let Some(rest) = line.strip_prefix("# rtk-hook-version:") {
-            if let Ok(v) = rest.trim().parse::<u8>() {
-                return v;
-            }
+        if let Some(rest) = line.strip_prefix("# rtk-hook-version:")
+            && let Ok(v) = rest.trim().parse::<u8>()
+        {
+            return v;
         }
     }
     0 // No version tag = version 0 (outdated)
 }
 
-#[cfg(test)]
-fn other_integration_installed(home: &std::path::Path) -> bool {
-    let paths = [
-        home.join(OPENCODE_PLUGIN_PATH),
-        home.join(CURSOR_DIR)
-            .join(HOOKS_SUBDIR)
-            .join(REWRITE_HOOK_FILE),
-        home.join(CODEX_DIR).join("AGENTS.md"),
-        home.join(GEMINI_DIR)
-            .join(HOOKS_SUBDIR)
-            .join(GEMINI_HOOK_FILE),
-    ];
-    paths.iter().any(|p| p.exists())
-}
-
 fn hook_installed_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let path = home
-        .join(CLAUDE_DIR)
-        .join(HOOKS_SUBDIR)
-        .join(REWRITE_HOOK_FILE);
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    let claude_dir = resolve_claude_dir().ok()?;
+    let path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
+    if path.exists() { Some(path) } else { None }
 }
 
 fn warn_marker_path() -> Option<PathBuf> {
-    let data_dir = dirs::data_local_dir()?.join(RTK_DATA_DIR);
+    let data_dir = user_dirs::data()?;
     Some(data_dir.join(".hook_warn_last"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::test_isolation;
+    use crate::core::user_env;
+    use crate::hooks::constants::{
+        CODEX_DIR, CONFIG_DIR, CURSOR_DIR, GEMINI_DIR, GEMINI_HOOK_FILE, HERMES_DIR,
+        HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HERMES_PLUGINS_SUBDIR,
+        OPENCODE_PLUGIN_FILE, OPENCODE_SUBDIR, PLUGIN_SUBDIR,
+    };
+
+    fn other_integration_installed(home: &std::path::Path) -> bool {
+        let paths = [
+            home.join(CONFIG_DIR)
+                .join(OPENCODE_SUBDIR)
+                .join(PLUGIN_SUBDIR)
+                .join(OPENCODE_PLUGIN_FILE),
+            home.join(CURSOR_DIR)
+                .join(HOOKS_SUBDIR)
+                .join(REWRITE_HOOK_FILE),
+            home.join(CODEX_DIR).join("AGENTS.md"),
+            home.join(GEMINI_DIR)
+                .join(HOOKS_SUBDIR)
+                .join(GEMINI_HOOK_FILE),
+            home.join(HERMES_DIR)
+                .join(HERMES_PLUGINS_SUBDIR)
+                .join(HERMES_PLUGIN_NAME)
+                .join(HERMES_PLUGIN_MANIFEST_FILE),
+        ];
+        paths.iter().any(|p| p.exists())
+    }
 
     #[test]
     fn test_parse_hook_version_present() {
@@ -139,6 +199,23 @@ mod tests {
     fn test_parse_hook_version_missing() {
         let content = "#!/usr/bin/env bash\n# old hook without version\n";
         assert_eq!(parse_hook_version(content), 0);
+    }
+
+    /// The shipped Claude hook script must carry the current version. `rtk init`
+    /// no longer installs it, so the version grades copies already deployed:
+    /// raising it reports older copies as outdated, which sends their owners to
+    /// `rtk init -g` and from there to the in-process hook. The constant and the
+    /// script move together.
+    #[test]
+    fn test_shipped_claude_hook_carries_the_current_version() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let content = std::fs::read_to_string(root.join("hooks/claude/rtk-rewrite.sh"))
+            .expect("read hooks/claude/rtk-rewrite.sh");
+        assert_eq!(
+            parse_hook_version(&content),
+            CURRENT_HOOK_VERSION,
+            "hooks/claude/rtk-rewrite.sh and CURRENT_HOOK_VERSION disagree"
+        );
     }
 
     #[test]
@@ -164,6 +241,29 @@ mod tests {
     }
 
     #[test]
+    fn test_binary_hook_registered_accepts_absolute_rtk_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(SETTINGS_JSON),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "/opt/homebrew/bin/rtk hook claude",
+                            "timeout": 5
+                        }]
+                    }]
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        assert!(binary_hook_registered(tmp.path()));
+    }
+
+    #[test]
     fn test_other_integration_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(!other_integration_installed(tmp.path()));
@@ -172,7 +272,12 @@ mod tests {
     #[test]
     fn test_other_integration_opencode() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join(OPENCODE_PLUGIN_PATH);
+        let path = tmp
+            .path()
+            .join(CONFIG_DIR)
+            .join(OPENCODE_SUBDIR)
+            .join(PLUGIN_SUBDIR)
+            .join(OPENCODE_PLUGIN_FILE);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"plugin").unwrap();
         assert!(other_integration_installed(tmp.path()));
@@ -214,42 +319,76 @@ mod tests {
     }
 
     #[test]
+    fn test_other_integration_hermes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp
+            .path()
+            .join(HERMES_DIR)
+            .join(HERMES_PLUGINS_SUBDIR)
+            .join(HERMES_PLUGIN_NAME)
+            .join(HERMES_PLUGIN_MANIFEST_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"plugin").unwrap();
+        assert!(other_integration_installed(tmp.path()));
+    }
+
+    #[test]
     fn test_other_integration_empty_dirs_not_enough() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(CURSOR_DIR).join(HOOKS_SUBDIR)).unwrap();
         std::fs::create_dir_all(tmp.path().join(CODEX_DIR)).unwrap();
         std::fs::create_dir_all(tmp.path().join(GEMINI_DIR)).unwrap();
+        std::fs::create_dir_all(
+            tmp.path()
+                .join(HERMES_DIR)
+                .join(HERMES_PLUGINS_SUBDIR)
+                .join(HERMES_PLUGIN_NAME),
+        )
+        .unwrap();
         assert!(!other_integration_installed(tmp.path()));
     }
 
     #[test]
-    fn test_status_returns_valid_variant() {
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => return,
-        };
-        let s = status();
-        let has_claude_hook = home
-            .join(".claude")
-            .join("hooks")
-            .join("rtk-rewrite.sh")
-            .exists();
-        let has_claude_dir = home.join(".claude").exists();
-        let has_other = other_integration_installed(&home);
+    fn test_warning_text_scopes_suppression_to_missing() {
+        assert_eq!(warning_text(HookStatus::Ok, false), None);
+        assert_eq!(warning_text(HookStatus::Ok, true), None);
+        assert!(
+            warning_text(HookStatus::Missing, false).is_some(),
+            "missing hook must warn when the flag is off"
+        );
+        assert_eq!(
+            warning_text(HookStatus::Missing, true),
+            None,
+            "suppress_hook_warning must hide HookStatus::Missing"
+        );
+        assert!(
+            warning_text(HookStatus::Outdated, false).is_some(),
+            "outdated hook must warn when the flag is off"
+        );
+        assert!(
+            warning_text(HookStatus::Outdated, true).is_some(),
+            "suppress_hook_warning must not hide the outdated-hook upgrade prompt"
+        );
+    }
 
-        match (has_claude_hook, has_claude_dir, has_other) {
-            (true, _, _) => assert!(
-                s == HookStatus::Ok || s == HookStatus::Outdated,
-                "Expected Ok or Outdated when Claude hook exists, got {:?}",
-                s
-            ),
-            (false, true, _) => assert_eq!(
-                s,
+    #[test]
+    fn test_status_returns_valid_variant() {
+        // `status()` resolves through `CLAUDE_CONFIG_DIR`; pinned so both
+        // states can be asserted.
+        let tmp = test_isolation::tempdir();
+        let claude_dir = tmp.path().join(".claude");
+        user_env::with_path("CLAUDE_CONFIG_DIR", Some(&claude_dir), || {
+            assert_eq!(
+                status(),
+                HookStatus::Ok,
+                "no Claude dir: nothing to warn about"
+            );
+            std::fs::create_dir_all(&claude_dir).expect("create Claude dir");
+            assert_eq!(
+                status(),
                 HookStatus::Missing,
-                "Expected Missing when .claude/ exists but hook absent, got {:?}",
-                s
-            ),
-            (false, false, _) => assert_eq!(s, HookStatus::Ok),
-        }
+                "a Claude dir with no rtk hook"
+            );
+        });
     }
 }
