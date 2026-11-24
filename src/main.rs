@@ -362,8 +362,8 @@ enum Commands {
         // flows to extra_args and is forwarded verbatim to grep/rg, which applies
         // genuine --max-count while RTK still compacts (matches how `rtk rg -m`
         // already behaves). --max keeps its long form.
-        #[arg(long, default_value = "200")]
-        max: usize,
+        #[arg(long)]
+        max: Option<usize>,
         /// Show only match context (not full line)
         #[arg(long)]
         context_only: bool,
@@ -2506,18 +2506,26 @@ fn run_cli() -> Result<i32> {
             max,
             context_only,
             extra_args,
-        } => search::run(
-            search::Engine::Grep,
-            max_len,
-            max,
-            context_only,
+        } => {
+            let max = max.unwrap_or_else(|| core::config::limits().grep_max_results);
+            search::run(
+                search::Engine::Grep,
+                max_len,
+                max,
+                context_only,
+                &extra_args,
+                cli.verbose,
+            )?
+        }
+        Commands::AstGrep { extra_args } => ast_grep_cmd::run(&extra_args)?,
+        Commands::Rg { extra_args } => search::run(
+            search::Engine::Rg,
+            80,
+            core::config::limits().grep_max_results,
+            false,
             &extra_args,
             cli.verbose,
         )?,
-        Commands::AstGrep { extra_args } => ast_grep_cmd::run(&extra_args)?,
-        Commands::Rg { extra_args } => {
-            search::run(search::Engine::Rg, 80, 200, false, &extra_args, cli.verbose)?
-        }
 
         Commands::Init {
             global,
@@ -3728,7 +3736,7 @@ mod tests {
             Commands::Grep {
                 max, extra_args, ..
             } => {
-                assert_eq!(max, 200, "max must stay at its default, not consume `-m`");
+                assert_eq!(max, None, "max must stay unset, not consume `-m`");
                 assert_eq!(extra_args, vec!["-m", "5", "pattern", "file"]);
             }
             _ => panic!("Expected Grep command"),
@@ -4691,7 +4699,7 @@ mod tests {
     }
 
     /// Parse `rtk grep …` into the full `Grep` field set for inspection.
-    fn parse_grep(args: &[&str]) -> Result<(usize, usize, bool, Vec<String>), clap::Error> {
+    fn parse_grep(args: &[&str]) -> Result<(usize, Option<usize>, bool, Vec<String>), clap::Error> {
         match Cli::try_parse_from(args)?.command {
             Commands::Grep {
                 max_len,
@@ -4720,7 +4728,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(max_len, 40);
-        assert_eq!(max, 5);
+        assert_eq!(max, Some(5));
         assert!(context_only);
         assert_eq!(extra_args, vec!["FOO", "path"]);
     }

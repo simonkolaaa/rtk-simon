@@ -2207,6 +2207,29 @@ pub(crate) fn format_status_output_detached(porcelain: &str, detached_ref: &str)
 }
 
 fn format_status_inner(porcelain: &str, detached: Option<&str>) -> String {
+    let limits = crate::core::config::limits();
+    format_status_inner_with_limits(
+        porcelain,
+        detached,
+        limits.status_max_files,
+        limits.status_max_untracked,
+    )
+}
+
+fn is_conflict_porcelain_line(line: &str) -> bool {
+    let mut chars = line.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('U'), _) | (_, Some('U')) | (Some('A'), Some('A')) | (Some('D'), Some('D'))
+    )
+}
+
+fn format_status_inner_with_limits(
+    porcelain: &str,
+    detached: Option<&str>,
+    max_files: usize,
+    max_untracked: usize,
+) -> String {
     let lines: Vec<&str> = porcelain
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -2217,23 +2240,83 @@ fn format_status_inner(porcelain: &str, detached: Option<&str>) -> String {
     }
 
     let mut output = Vec::new();
+    let has_branch_header = lines.first().is_some_and(|l| l.starts_with("##"));
 
-    if let Some(branch_line) = lines.first() {
-        if branch_line.starts_with("##") {
-            let branch = branch_line.trim_start_matches("## ");
-            let display = detached.unwrap_or(branch);
-            output.push(format!("* {}", display));
-        } else {
-            output.push((*branch_line).to_string());
+    if has_branch_header {
+        let branch = lines[0].trim_start_matches("## ");
+        let display = detached.unwrap_or(branch);
+        output.push(format!("* {}", display));
+    }
+
+    if lines.len() == 1 && has_branch_header {
+        output.push("clean — nothing to commit".to_string());
+        return output.join("\n");
+    }
+
+    let rest = if has_branch_header {
+        &lines[1..]
+    } else {
+        &lines[..]
+    };
+    let tracked: Vec<&str> = rest
+        .iter()
+        .copied()
+        .filter(|line| !line.starts_with("?? "))
+        .collect();
+    let untracked: Vec<&str> = rest
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("?? "))
+        .collect();
+
+    if tracked.len() <= max_files && untracked.len() <= max_untracked {
+        for line in rest {
+            output.push((*line).to_string());
+        }
+        return output.join("\n");
+    }
+
+    if tracked.len() <= max_files {
+        for line in &tracked {
+            output.push((*line).to_string());
+        }
+    } else {
+        let conflicts: Vec<&str> = tracked
+            .iter()
+            .copied()
+            .filter(|line| is_conflict_porcelain_line(line))
+            .collect();
+        let non_conflicts: Vec<&str> = tracked
+            .iter()
+            .copied()
+            .filter(|line| !is_conflict_porcelain_line(line))
+            .collect();
+        let non_conflict_cap = max_files.saturating_sub(conflicts.len());
+        let mut kept_non_conflicts = 0usize;
+        for line in &tracked {
+            if is_conflict_porcelain_line(line) {
+                output.push((*line).to_string());
+            } else if kept_non_conflicts < non_conflict_cap {
+                output.push((*line).to_string());
+                kept_non_conflicts += 1;
+            }
+        }
+        let omitted = non_conflicts.len().saturating_sub(kept_non_conflicts);
+        if omitted > 0 {
+            output.push(format!("... (+{} more files)", omitted));
         }
     }
 
-    for line in lines.iter().skip(1) {
-        output.push((*line).to_string());
-    }
-
-    if lines.len() == 1 && lines[0].starts_with("##") {
-        output.push("clean — nothing to commit".to_string());
+    if untracked.len() <= max_untracked {
+        for line in &untracked {
+            output.push((*line).to_string());
+        }
+    } else {
+        for line in untracked.iter().take(max_untracked) {
+            output.push((*line).to_string());
+        }
+        let omitted = untracked.len() - max_untracked;
+        output.push(format!("... (+{} more untracked files)", omitted));
     }
 
     output.join("\n")
@@ -5294,6 +5377,25 @@ A  added.rs
         assert!(result.contains("UU conflict.rs"));
         assert!(result.contains("MM mixed.rs"));
         assert!(!result.contains("conflicts:"));
+    }
+
+    #[test]
+    fn test_format_status_limits_tracked_and_untracked_preserving_conflicts() {
+        let mut porcelain = String::from("## main\n");
+        for i in 0..12 {
+            porcelain.push_str(&format!(" M src/file_{i}.rs\n"));
+        }
+        porcelain.push_str("UU src/conflict.rs\n");
+        for i in 0..7 {
+            porcelain.push_str(&format!("?? tmp/untracked_{i}.txt\n"));
+        }
+
+        let result = format_status_inner_with_limits(&porcelain, None, 10, 5);
+        assert!(result.contains("UU src/conflict.rs"));
+        assert!(result.contains("... (+3 more files)"));
+        assert!(result.contains("... (+2 more untracked files)"));
+        assert!(!result.contains("src/file_11.rs"));
+        assert!(!result.contains("tmp/untracked_6.txt"));
     }
 
     #[test]
